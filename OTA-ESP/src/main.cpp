@@ -11,8 +11,8 @@ void setup() {
   Serial.begin(115200);
   delay(1000); // wait for serial to be ready
   Serial.println("Hello World");
-
   // so far I have setup linkage to my serial console. Let me setup GPIO pins for driving PA18 and NRST
+  // GPIO CONFIG 
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(D12, OUTPUT); // I will use D12 to control PA18
   pinMode(D11, OUTPUT); // let me use D11 ro control NRST
@@ -29,22 +29,26 @@ MSPM0 flash-based UART is enabled with following configuration by default:
 • One stop bit
 • No parity
 */
-digitalWrite(LED_BUILTIN, HIGH);
-while (digitalRead(D10)!= HIGH) {
 
+// wait for button to be pressed ( this will change to some kind of softwarde signal later)
+while (digitalRead(D10)!= HIGH) {
 }
-digitalWrite(LED_BUILTIN, LOW);
   Serial2.begin(9600, SERIAL_8N1, D0, D1); // TX and RX on ESP32
+
   // make sure to aslo connect grounds 
-  enterBSL();
+ enterBSL();
   if (sendConnection() == true) {
     Serial.println("Connection successful - LED should be ON");
   } else {
     Serial.println("Connection failed - LED should be blinking or OFF");
   }
-}
+ }
 
 void loop() {
+  // enterBSL();
+  // Serial.print(Serial2.read());
+  // // sendConnection();
+  // delay(100);
 
 }
 
@@ -63,27 +67,34 @@ uint32_t crc32_iso(const uint8_t *data, size_t len)
 }
 
 void enterBSL() {
-  digitalWrite(D12, LOW);    // Step 0: ensure PA18 LOW
-  digitalWrite(D11, LOW);    // Step 1: NRST LOW (reset)
-  delay(10);                 // Hold reset for ~10 ms
+  // Step 0: Assert BSL_invoke (PA18) high first
+  digitalWrite(D12, HIGH);   // PA18 = BSL_invoke, active high
+  delay(500);     // hold it for 500ms
 
-  digitalWrite(D12, HIGH);   // Step 2: PA18 HIGH (before NRST is released)
-  delay(1);                  // Small delay to ensure it's latched
+  // Step 1: Pulse NRST low to trigger BOOTRST
+  digitalWrite(D11, LOW);     // NRST low (reset)
+  delay(2);                   // hold reset low; 100µs+ is more than enough (2ms here is safe)
 
-  digitalWrite(D11, HIGH);   // Step 3: Release NRST
-  delay(10);                 // Step 4: Hold PA18 high for a bit
+  // Step 2: Release NRST
+  digitalWrite(D11, HIGH);    // NRST high — device boots, sees BSL_invoke high
 
-  // Optional: PA18 can be pulled low now or just left high
+  // Step 3: Keep BSL_invoke high briefly while bootloader starts
+  delay(500); // give some time for bootcode to sample and enter BSL
+  // Optional: you can pull PA18 low afterward if your application reuses it
 }
 
+
 bool sendConnection() {
+  while (Serial2.available()) {
+    Serial.println(Serial2.read());
+  }
   Serial2.write(0x80); // header
 
   Serial2.write(0x01); // Length
   Serial2.write(0x00);
 
-  Serial2.write(0x12); // command (all my data)
-  uint8_t data = 0x12;
+  Serial2.write(0x19); // command (all my data)
+  uint8_t data = 0x19;
   uint32_t crc32Code = crc32_iso(&data, 1);
 
 Serial2.write((uint8_t)(crc32Code & 0xFF));         // LSB
@@ -91,47 +102,31 @@ Serial2.write((uint8_t)((crc32Code >> 8) & 0xFF));
 Serial2.write((uint8_t)((crc32Code >> 16) & 0xFF));
 Serial2.write((uint8_t)((crc32Code >> 24) & 0xFF)); // MSB
 
-  while (Serial2.available() < 1) {
-    delay(1);
-  }
 
+  while (Serial2.available() < 1) {
+    delay(1); // wait for response
+    digitalWrite(LED_BUILTIN, HIGH);
+  }
+  digitalWrite(LED_BUILTIN, LOW);
+uint32_t Tresponse = 0x00;
   Serial.println("made it past getting a response ");
-  while (Serial2.available() > 1) {
+  while (Serial2.available() > 0) {
   uint8_t response = Serial2.read();
+  Tresponse = Tresponse << 8 | response;
   Serial.print("Response code received: 0x");
   Serial.println(response, HEX);
   }
-  // Display the actual response code
-  uint8_t response;
-  Serial.print("Response code received: 0x");
-  Serial.println(response, HEX);
-  
-  if (response == 0x00) {
+  if (Serial2.available()) {
+    Serial.println("is still availabel");
+  }
+  if (Tresponse == 0x00) {
     Serial.println("SUCCESS: ACK received");
     digitalWrite(LED_BUILTIN, HIGH); // Turn on LED for success
     return true;
   }
   
-  // Handle error codes (0x5x range)
-  if (response >= 0x50 && response <= 0x5F) {
-    Serial.print("ERROR: BSL error code 0x");
-    Serial.println(response, HEX);
-    
-    // Blink LED to indicate error
-    digitalWrite(LED_BUILTIN, HIGH);
-    delay(500);
-    digitalWrite(LED_BUILTIN, LOW);
-    delay(500);
-    digitalWrite(LED_BUILTIN, HIGH);
-    delay(500);
-    digitalWrite(LED_BUILTIN, LOW);
-    
-    return false;
-  }
-  
   // Unknown response
   Serial.print("UNKNOWN response: 0x");
-  Serial.println(response, HEX);
   digitalWrite(LED_BUILTIN, LOW);
   return false;
 }
