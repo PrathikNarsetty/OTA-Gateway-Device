@@ -1,5 +1,5 @@
 // Prathik Narsetty
-// ESP32 OTA Gateway for MSPM0 Programming - Automatic SPIFFS Detection
+// ESP32 OTA Gateway for MSPM0 Programming - PlatformIO OTA SPIFFS
 #include <Arduino.h>
 #include <SPIFFS.h>
 #include <stdint.h>
@@ -32,8 +32,8 @@ const uint8_t BSL_PW_RESET[32] = {
 // Global Variables
 uint8_t BSL_TX_buffer[256];
 uint8_t BSL_RX_buffer[256];
-const char* FIRMWARE_PATH = "/firmware.bin";
 bool programmingInProgress = false;
+const char* FIRMWARE_PATH = "/mspm0_firmware.bin";
 size_t lastFirmwareSize = 0;
 
 // BSL Error Codes
@@ -63,7 +63,7 @@ void triggerProgramming();
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("ESP32 OTA Gateway - Automatic SPIFFS Detection");
+  Serial.println("ESP32 OTA Gateway - PlatformIO OTA SPIFFS");
   
   // Setup GPIO and SPIFFS
   setupGPIO();
@@ -73,7 +73,7 @@ void setup() {
   Serial2.begin(9600, SERIAL_8N1, D0, D1);
   
   Serial.println("Setup complete. Waiting for firmware updates...");
-  Serial.println("Upload firmware to SPIFFS with: pio run --target uploadfs");
+  Serial.println("Upload firmware to SPIFFS with: pio run -t uploadfs --upload-port <ESP_IP>");
   
   // Check initial firmware status
   checkForNewFirmware();
@@ -186,8 +186,8 @@ void triggerProgramming() {
   
   // Check if firmware file exists
   if (!SPIFFS.exists(FIRMWARE_PATH)) {
-    Serial.println("ERROR: No firmware.bin file found!");
-    Serial.println("Please upload firmware with: pio run --target uploadfs");
+    Serial.println("ERROR: No firmware file found!");
+    Serial.println("Please upload firmware with: pio run -t uploadfs --upload-port <ESP_IP>");
     digitalWrite(PIN_LED, LOW);
     programmingInProgress = false;
     return;
@@ -268,7 +268,7 @@ bool performBSLProgramming() {
     return false;
   }
   
-  // Step 6: Program firmware
+  // Step 6: Program firmware from SPIFFS
   if (bslProgramData() != eBSL_success) {
     Serial.println("Firmware programming failed");
     return false;
@@ -376,7 +376,7 @@ BSL_error_t bslMassErase() {
 }
 
 BSL_error_t bslProgramData() {
-  Serial.println("Programming firmware data...");
+  Serial.println("Programming firmware from SPIFFS...");
   
   File file = SPIFFS.open(FIRMWARE_PATH, "r");
   if (!file) {
