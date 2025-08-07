@@ -40,7 +40,8 @@ size_t lastFirmwareSize = 0;
 // BSL Error Codes
 enum {
     eBSL_success = 0,
-    eBSL_unknownError = 7
+    eBSL_unknownError = 7,
+    eBSL_criticalFailure = 8
 };
 typedef uint8_t BSL_error_t;
 
@@ -56,6 +57,7 @@ BSL_error_t bslProgramData();
 BSL_error_t bslVerifyData();
 BSL_error_t bslStartApp();
 BSL_error_t bslGetResponse();
+void handleCriticalFailure(const char* errorMsg);
 void enterLightSleep();
 void setupGPIO();
 void setupSPIFFS();
@@ -271,16 +273,28 @@ bool performBSLProgramming() {
   }
   
   // Step 6: Program firmware from SPIFFS
-  if (bslProgramData() != eBSL_success) {
-    Serial.println("Firmware programming failed");
-    return false;
+  BSL_error_t programResult = bslProgramData();
+  if (programResult != eBSL_success) {
+    if (programResult == eBSL_criticalFailure) {
+      Serial.println("CRITICAL: Programming failed - device has been reset");
+      return false;
+    } else {
+      Serial.println("Firmware programming failed");
+      return false;
+    }
   }
   
   // Step 7: Verify programmed data
   Serial.println("=== Starting Data Verification ===");
-  if (bslVerifyData() != eBSL_success) {
-    Serial.println("Data verification failed!");
-    return false;
+  BSL_error_t verifyResult = bslVerifyData();
+  if (verifyResult != eBSL_success) {
+    if (verifyResult == eBSL_criticalFailure) {
+      Serial.println("CRITICAL: Verification failed - device has been reset");
+      return false;
+    } else {
+      Serial.println("Data verification failed!");
+      return false;
+    }
   }
   Serial.println("=== Data Verification Passed ===");
   
@@ -434,12 +448,34 @@ BSL_error_t bslProgramData() {
     // Send packet
     Serial2.write(BSL_TX_buffer, 10 + bytesRead + 4);
     
-    // Wait for response
-    if (bslGetResponse() != eBSL_success) {
-      Serial.println("Data block programming failed");
-      file.close();
-      return eBSL_unknownError;
-    }
+         // Wait for response with enhanced retry logic
+     int retryCount = 0;
+     const int maxRetries = 10; // Increased to 10 retries
+     BSL_error_t response;
+     
+     do {
+       response = bslGetResponse();
+       if (response != eBSL_success) {
+         retryCount++;
+         Serial.print("Data block programming failed, retry ");
+         Serial.print(retryCount);
+         Serial.print("/");
+         Serial.println(maxRetries);
+         
+         if (retryCount < maxRetries) {
+           delay(100); // Wait before retry
+           // Resend the same packet
+           Serial2.write(BSL_TX_buffer, 10 + bytesRead + 4);
+         }
+       }
+     } while (response != eBSL_success && retryCount < maxRetries);
+     
+     if (response != eBSL_success) {
+       Serial.println("CRITICAL: Data block programming failed after 10 retries");
+       file.close();
+       handleCriticalFailure("CRC32/Programming failure after 10 retries");
+       return eBSL_criticalFailure;
+     }
     
     address += bytesRead;
     Serial.print("Programmed ");
@@ -497,22 +533,43 @@ BSL_error_t bslVerifyData() {
     BSL_TX_buffer[12] = (crc >> 16) & 0xFF;
     BSL_TX_buffer[13] = (crc >> 24) & 0xFF;
     
-    // Send read command
-    Serial2.write(BSL_TX_buffer, 14);
-    
-    // Wait for response and read back data
-    delay(100);
-    int responseBytes = 0;
-    while (Serial2.available() && responseBytes < (bytesRead + 8)) { // +8 for header and CRC
-      BSL_RX_buffer[responseBytes] = Serial2.read();
-      responseBytes++;
-    }
-    
-    if (responseBytes < (bytesRead + 8)) {
-      Serial.println("Insufficient readback data received");
-      file.close();
-      return eBSL_unknownError;
-    }
+               // Send read command with enhanced retry logic
+      int retryCount = 0;
+      const int maxRetries = 10; // Increased to 10 retries
+      bool readSuccess = false;
+     
+     do {
+       Serial2.write(BSL_TX_buffer, 14);
+       
+       // Wait for response and read back data
+       delay(100);
+       int responseBytes = 0;
+       while (Serial2.available() && responseBytes < (bytesRead + 8)) { // +8 for header and CRC
+         BSL_RX_buffer[responseBytes] = Serial2.read();
+         responseBytes++;
+       }
+       
+       if (responseBytes >= (bytesRead + 8)) {
+         readSuccess = true;
+       } else {
+         retryCount++;
+         Serial.print("Insufficient readback data, retry ");
+         Serial.print(retryCount);
+         Serial.print("/");
+         Serial.println(maxRetries);
+         
+         if (retryCount < maxRetries) {
+           delay(100); // Wait before retry
+         }
+       }
+     } while (!readSuccess && retryCount < maxRetries);
+     
+           if (!readSuccess) {
+        Serial.println("CRITICAL: Insufficient readback data after 10 retries");
+        file.close();
+        handleCriticalFailure("Verification readback failure after 10 retries");
+        return eBSL_criticalFailure;
+      }
     
     // Extract readback data (skip header and CRC)
     memcpy(readbackBuffer, &BSL_RX_buffer[4], bytesRead);
@@ -589,4 +646,34 @@ BSL_error_t bslGetResponse() {
     Serial.println("No response received");
     return eBSL_unknownError;
   }
+}
+
+void handleCriticalFailure(const char* errorMsg) {
+  Serial.println("=== CRITICAL FAILURE DETECTED ===");
+  Serial.print("Error: ");
+  Serial.println(errorMsg);
+  Serial.println("Performing emergency mass erase to reset device state...");
+  
+  // Turn on LED to indicate error state
+  digitalWrite(PIN_LED, HIGH);
+  
+  // Attempt mass erase to reset device
+  if (bslMassErase() == eBSL_success) {
+    Serial.println("Emergency mass erase completed successfully");
+    Serial.println("Device has been reset to blank state");
+  } else {
+    Serial.println("WARNING: Emergency mass erase failed!");
+    Serial.println("Device may be in an inconsistent state");
+  }
+  
+  // Blink LED rapidly to indicate error
+  for (int i = 0; i < 10; i++) {
+    digitalWrite(PIN_LED, HIGH);
+    delay(200);
+    digitalWrite(PIN_LED, LOW);
+    delay(200);
+  }
+  
+  Serial.println("=== CRITICAL FAILURE HANDLED ===");
+  Serial.println("Please check hardware connections and try again");
 }
