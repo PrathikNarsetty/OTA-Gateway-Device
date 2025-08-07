@@ -1,10 +1,20 @@
 // Prathik Narsetty
-// ESP32 OTA Gateway for MSPM0 Programming - Sleep Mode Version
+// ESP32 OTA Gateway for MSPM0 Programming - Light Sleep Mode Version
 #include <Arduino.h>
 #include <SPIFFS.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
 #include <stdint.h>
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
+
+// WiFi Configuration
+const char* ssid = "YourWiFiSSID";
+const char* password = "YourWiFiPassword";
+
+// Web Server for remote trigger and upload
+WebServer server(80);
 
 // GPIO Configuration
 #define PIN_PA18 D12      // BSL invoke pin
@@ -33,6 +43,8 @@ const uint8_t BSL_PW_RESET[32] = {
 uint8_t BSL_TX_buffer[256];
 uint8_t BSL_RX_buffer[256];
 const char* FIRMWARE_PATH = "/firmware.bin";
+bool programmingInProgress = false;
+bool firmwareUploaded = false;
 
 // BSL Error Codes
 enum {
@@ -52,14 +64,21 @@ BSL_error_t bslMassErase();
 BSL_error_t bslProgramData();
 BSL_error_t bslStartApp();
 BSL_error_t bslGetResponse();
-void enterSleepMode();
+void enterLightSleep();
 void setupGPIO();
 void setupSPIFFS();
+void setupWiFi();
+void setupWebServer();
+void handleRoot();
+void handleUpload();
+void handleTrigger();
+void handleStatus();
+void handleProgram();
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("ESP32 OTA Gateway - Sleep Mode");
+  Serial.println("ESP32 OTA Gateway - Light Sleep Mode with Web Upload");
   
   // Setup GPIO and SPIFFS
   setupGPIO();
@@ -68,30 +87,52 @@ void setup() {
   // Initialize UART for MSPM0 communication
   Serial2.begin(9600, SERIAL_8N1, D0, D1);
   
-  Serial.println("Setup complete. Waiting for OTA trigger...");
-  Serial.println("Place firmware.bin in data/ folder and upload with SPIFFS");
+  // Setup WiFi and Web Server
+  setupWiFi();
+  setupWebServer();
+  
+  Serial.println("Setup complete. Web interface available at:");
+  Serial.print("http://");
+  Serial.println(WiFi.localIP());
+  Serial.println("Upload firmware through web interface or use external trigger");
   
   // Check if firmware file exists
   if (SPIFFS.exists(FIRMWARE_PATH)) {
     File file = SPIFFS.open(FIRMWARE_PATH, "r");
-    Serial.print("Firmware file found: ");
+    Serial.print("Existing firmware file found: ");
     Serial.print(file.size());
     Serial.println(" bytes");
     file.close();
+    firmwareUploaded = true;
   } else {
-    Serial.println("WARNING: No firmware.bin file found!");
-    Serial.println("Please place firmware.bin in the data/ folder");
+    Serial.println("No firmware file found. Upload one through web interface.");
   }
   
-  // Enter sleep mode immediately
-  enterSleepMode();
+  // Enter light sleep mode
+  enterLightSleep();
 }
 
 void loop() {
-  // This should never be reached in normal operation
-  // The device will wake up, perform OTA, then go back to sleep
-  Serial.println("Unexpected wake - going back to sleep");
-  enterSleepMode();
+  // Handle web server requests
+  server.handleClient();
+  
+  // Check for external trigger
+  static bool lastButtonState = HIGH;
+  bool currentButtonState = digitalRead(PIN_TRIGGER);
+  
+  if (lastButtonState == HIGH && currentButtonState == LOW && !programmingInProgress) {
+    Serial.println("External trigger detected!");
+    triggerProgramming();
+  }
+  
+  lastButtonState = currentButtonState;
+  
+  // If not programming, enter light sleep periodically
+  if (!programmingInProgress) {
+    enterLightSleep();
+  }
+  
+  delay(100);
 }
 
 void setupGPIO() {
@@ -112,22 +153,317 @@ void setupSPIFFS() {
   Serial.println("SPIFFS mounted successfully");
 }
 
-void enterSleepMode() {
-  Serial.println("Entering deep sleep mode...");
-  Serial.println("Connect PIN_TRIGGER (D10) to GND to wake and program");
+void setupWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
   
-  // Configure wake-up source
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_TRIGGER, 0); // Wake on LOW
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println();
+  Serial.print("Connected to WiFi. IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void setupWebServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/upload", HTTP_POST, handleUpload);
+  server.on("/trigger", HTTP_POST, handleTrigger);
+  server.on("/program", HTTP_POST, handleProgram);
+  server.on("/status", HTTP_GET, handleStatus);
+  
+  server.begin();
+  Serial.println("Web server started");
+}
+
+void handleRoot() {
+  String html = R"(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MSPM0 OTA Gateway</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .section { margin: 30px 0; padding: 20px; border: 1px solid #ddd; border-radius: 5px; }
+        .upload-area { border: 2px dashed #007cba; padding: 30px; text-align: center; margin: 20px 0; background: #f8f9fa; border-radius: 5px; }
+        .btn { background: #007cba; color: white; padding: 12px 24px; border: none; cursor: pointer; border-radius: 5px; font-size: 16px; }
+        .btn:hover { background: #005a87; }
+        .btn:disabled { background: #ccc; cursor: not-allowed; }
+        .status { margin: 20px 0; padding: 15px; border-radius: 5px; }
+        .success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .info { background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
+        .progress { width: 100%; height: 20px; background: #f0f0f0; border-radius: 10px; overflow: hidden; }
+        .progress-bar { height: 100%; background: #007cba; width: 0%; transition: width 0.3s; }
+        .file-info { margin: 10px 0; padding: 10px; background: #e9ecef; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 MSPM0 OTA Gateway</h1>
+        <p>Upload MSPM0 firmware and program devices remotely</p>
+        
+        <div class="section">
+            <h2>📁 Upload Firmware</h2>
+            <div class="upload-area">
+                <form id="uploadForm" enctype="multipart/form-data">
+                    <input type="file" id="firmwareFile" accept=".bin,.hex" required style="margin: 10px;">
+                    <br>
+                    <button type="submit" class="btn">Upload Firmware</button>
+                </form>
+                <div class="progress" id="progressBar" style="display: none;">
+                    <div class="progress-bar" id="progressBarFill"></div>
+                </div>
+            </div>
+            <div id="fileInfo" class="file-info" style="display: none;"></div>
+        </div>
+        
+        <div class="section">
+            <h2>⚡ Program MSPM0</h2>
+            <p>Current Status: <span id="status">Idle</span></p>
+            <button id="programBtn" class="btn" onclick="programDevice()" disabled>Start Programming</button>
+            <div id="result" class="status"></div>
+        </div>
+        
+        <div class="section">
+            <h2>📊 System Info</h2>
+            <p><strong>ESP32 IP:</strong> <span id="esp32IP">Loading...</span></p>
+            <p><strong>Firmware Status:</strong> <span id="firmwareStatus">Checking...</span></p>
+            <p><strong>Programming Status:</strong> <span id="programmingStatus">Idle</span></p>
+        </div>
+    </div>
+    
+    <script>
+        // Update ESP32 IP
+        document.getElementById('esp32IP').textContent = window.location.hostname;
+        
+        // File upload handling
+        document.getElementById('uploadForm').onsubmit = function(e) {
+            e.preventDefault();
+            const fileInput = document.getElementById('firmwareFile');
+            const file = fileInput.files[0];
+            
+            if (!file) {
+                showResult('Please select a file', 'error');
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('firmware', file);
+            
+            // Show progress bar
+            document.getElementById('progressBar').style.display = 'block';
+            document.getElementById('progressBarFill').style.width = '0%';
+            
+            // Simulate progress (since we can't get real upload progress easily)
+            let progress = 0;
+            const progressInterval = setInterval(() => {
+                progress += Math.random() * 10;
+                if (progress > 90) progress = 90;
+                document.getElementById('progressBarFill').style.width = progress + '%';
+            }, 100);
+            
+            fetch('/upload', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                clearInterval(progressInterval);
+                document.getElementById('progressBarFill').style.width = '100%';
+                
+                if (data.success) {
+                    showResult('Firmware uploaded successfully! File size: ' + data.size + ' bytes', 'success');
+                    document.getElementById('programBtn').disabled = false;
+                    updateFirmwareStatus();
+                } else {
+                    showResult('Upload failed: ' + data.error, 'error');
+                }
+            })
+            .catch(error => {
+                clearInterval(progressInterval);
+                showResult('Upload error: ' + error, 'error');
+            })
+            .finally(() => {
+                setTimeout(() => {
+                    document.getElementById('progressBar').style.display = 'none';
+                }, 2000);
+            });
+        };
+        
+        // Programming function
+        function programDevice() {
+            document.getElementById('programmingStatus').textContent = 'Programming...';
+            document.getElementById('programBtn').disabled = true;
+            showResult('Starting programming...', 'info');
+            
+            fetch('/program', {
+                method: 'POST'
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showResult('Programming completed successfully!', 'success');
+                    document.getElementById('programmingStatus').textContent = 'Completed';
+                } else {
+                    showResult('Programming failed: ' + data.error, 'error');
+                    document.getElementById('programmingStatus').textContent = 'Failed';
+                }
+            })
+            .catch(error => {
+                showResult('Programming error: ' + error, 'error');
+                document.getElementById('programmingStatus').textContent = 'Error';
+            })
+            .finally(() => {
+                document.getElementById('programBtn').disabled = false;
+                updateStatus();
+            });
+        }
+        
+        function showResult(message, type) {
+            const resultDiv = document.getElementById('result');
+            resultDiv.textContent = message;
+            resultDiv.className = 'status ' + type;
+        }
+        
+        function updateStatus() {
+            fetch('/status')
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('status').textContent = data.status;
+                document.getElementById('programmingStatus').textContent = data.programming ? 'Programming' : 'Idle';
+            });
+        }
+        
+        function updateFirmwareStatus() {
+            fetch('/status')
+            .then(response => response.json())
+            .then(data => {
+                if (data.firmwareUploaded) {
+                    document.getElementById('firmwareStatus').textContent = 'Firmware ready';
+                    document.getElementById('programBtn').disabled = false;
+                } else {
+                    document.getElementById('firmwareStatus').textContent = 'No firmware uploaded';
+                    document.getElementById('programBtn').disabled = true;
+                }
+            });
+        }
+        
+        // Update status every 5 seconds
+        setInterval(updateStatus, 5000);
+        
+        // Initial status update
+        updateFirmwareStatus();
+    </script>
+</body>
+</html>
+  )";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleUpload() {
+  HTTPUpload& upload = server.upload();
+  
+  if (upload.status == UPLOAD_FILE_START) {
+    String filename = "/firmware.bin";
+    
+    // Open file for writing
+    File file = SPIFFS.open(filename, "w");
+    if (!file) {
+      server.send(500, "application/json", "{\"success\":false,\"error\":\"Failed to create file\"}");
+      return;
+    }
+    file.close();
+    
+    Serial.println("Starting firmware upload...");
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    File file = SPIFFS.open("/firmware.bin", "a");
+    if (file) {
+      file.write(upload.buf, upload.currentSize);
+      file.close();
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    File file = SPIFFS.open("/firmware.bin", "r");
+    if (file) {
+      size_t fileSize = file.size();
+      file.close();
+      
+      firmwareUploaded = true;
+      String response = "{\"success\":true,\"size\":" + String(fileSize) + "}";
+      server.send(200, "application/json", response);
+      
+      Serial.print("Firmware uploaded successfully: ");
+      Serial.print(fileSize);
+      Serial.println(" bytes");
+    } else {
+      server.send(500, "application/json", "{\"success\":false,\"error\":\"Failed to read uploaded file\"}");
+    }
+  }
+}
+
+void handleTrigger() {
+  if (programmingInProgress) {
+    server.send(400, "application/json", "{\"success\":false,\"error\":\"Programming already in progress\"}");
+    return;
+  }
+  
+  triggerProgramming();
+  server.send(200, "application/json", "{\"success\":true}");
+}
+
+void handleProgram() {
+  if (programmingInProgress) {
+    server.send(400, "application/json", "{\"success\":false,\"error\":\"Programming already in progress\"}");
+    return;
+  }
+  
+  if (!firmwareUploaded || !SPIFFS.exists(FIRMWARE_PATH)) {
+    server.send(400, "application/json", "{\"success\":false,\"error\":\"No firmware uploaded\"}");
+    return;
+  }
+  
+  triggerProgramming();
+  server.send(200, "application/json", "{\"success\":true}");
+}
+
+void handleStatus() {
+  String status = programmingInProgress ? "Programming" : "Idle";
+  String response = "{\"status\":\"" + status + "\",\"firmwareUploaded\":" + String(firmwareUploaded ? "true" : "false") + ",\"programming\":" + String(programmingInProgress ? "true" : "false") + "}";
+  server.send(200, "application/json", response);
+}
+
+void enterLightSleep() {
+  Serial.println("Entering light sleep mode...");
+  Serial.println("WiFi remains active for remote triggers");
   
   // Turn off LED to indicate sleep
   digitalWrite(PIN_LED, LOW);
   
-  // Enter deep sleep
-  esp_deep_sleep_start();
+  // Configure light sleep with WiFi wake
+  esp_sleep_enable_timer_wakeup(10000000); // 10 seconds
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_TRIGGER, 0); // Wake on LOW
+  
+  // Enter light sleep (WiFi stays active)
+  esp_light_sleep_start();
+  
+  // Wake up and continue
+  Serial.println("Waking from light sleep...");
 }
 
-void wakeUpRoutine() {
-  Serial.println("=== WAKING UP - OTA TRIGGERED ===");
+void triggerProgramming() {
+  if (programmingInProgress) {
+    Serial.println("Programming already in progress!");
+    return;
+  }
+  
+  programmingInProgress = true;
+  Serial.println("=== TRIGGERING OTA PROGRAMMING ===");
   
   // Turn on LED to indicate activity
   digitalWrite(PIN_LED, HIGH);
@@ -136,9 +472,9 @@ void wakeUpRoutine() {
   // Check if firmware file exists
   if (!SPIFFS.exists(FIRMWARE_PATH)) {
     Serial.println("ERROR: No firmware.bin file found!");
-    Serial.println("Please place firmware.bin in the data/ folder");
+    Serial.println("Please upload firmware through web interface");
     digitalWrite(PIN_LED, LOW);
-    enterSleepMode();
+    programmingInProgress = false;
     return;
   }
   
@@ -151,9 +487,11 @@ void wakeUpRoutine() {
     digitalWrite(PIN_LED, LOW);
   }
   
-  // Wait a bit then go back to sleep
+  programmingInProgress = false;
+  
+  // Wait a bit then return to normal operation
   delay(5000);
-  enterSleepMode();
+  digitalWrite(PIN_LED, LOW);
 }
 
 uint32_t crc32_iso(const uint8_t *data, size_t len) {
@@ -424,47 +762,5 @@ BSL_error_t bslGetResponse() {
   } else {
     Serial.println("No response received");
     return eBSL_unknownError;
-  }
-}
-
-void setup() {
-  // Check wake-up reason
-  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
-    // Woken up by external trigger
-    Serial.begin(115200);
-    delay(1000);
-    wakeUpRoutine();
-  } else {
-    // First boot or other wake reason
-    Serial.begin(115200);
-    delay(1000);
-    Serial.println("ESP32 OTA Gateway - Sleep Mode");
-    
-    // Setup GPIO and SPIFFS
-    setupGPIO();
-    setupSPIFFS();
-    
-    // Initialize UART for MSPM0 communication
-    Serial2.begin(9600, SERIAL_8N1, D0, D1);
-    
-    Serial.println("Setup complete. Waiting for OTA trigger...");
-    Serial.println("Place firmware.bin in data/ folder and upload with SPIFFS");
-    
-    // Check if firmware file exists
-    if (SPIFFS.exists(FIRMWARE_PATH)) {
-      File file = SPIFFS.open(FIRMWARE_PATH, "r");
-      Serial.print("Firmware file found: ");
-      Serial.print(file.size());
-      Serial.println(" bytes");
-      file.close();
-    } else {
-      Serial.println("WARNING: No firmware.bin file found!");
-      Serial.println("Please place firmware.bin in the data/ folder");
-    }
-    
-    // Enter sleep mode immediately
-    enterSleepMode();
   }
 }
