@@ -1,8 +1,0 @@
-# Place your MSPM0 firmware .bin file here
-# Rename it to: mspm0_firmware.bin
-# 
-# Example workflow:
-# 1. Compile your MSPM0 firmware: arm-none-eabi-objcopy -O binary your_app.out mspm0_firmware.bin
-# 2. Copy mspm0_firmware.bin to this data/ folder
-# 3. Upload to ESP32: pio run -t uploadfs --upload-port <ESP_IP>
-# 4. ESP32 automatically programs MSPM0 

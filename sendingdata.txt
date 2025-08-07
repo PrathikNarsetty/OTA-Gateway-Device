@@ -1,1 +1,0 @@
- for the MSPM0 ROM-BSL the CRC32 (and every other multi-byte field) has to be sent little-endian, byte-order LSB-first.

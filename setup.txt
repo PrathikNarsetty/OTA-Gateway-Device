@@ -1,7 +1,0 @@
-Any user who wants to setup BSL invoke from MCU to MCU must first setup it up within system config.\
-
--> GPIO PA18 is invoke and bring it low
--> UART0 (PA10 and PA11)
-
-Expected CRC32 is 0x62611B62
-I will add to this document as needed

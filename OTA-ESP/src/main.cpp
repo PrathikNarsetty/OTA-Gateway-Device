@@ -19,6 +19,7 @@
 #define CMD_RX_PASSWORD (0x21)
 #define CMD_MASS_ERASE (0x15)
 #define CMD_PROGRAMDATA (0x20)
+#define CMD_TX_DATA_BLOCK (0x06)  // Read back programmed data
 #define CMD_START_APP (0x40)
 
 // BSL Password (all 0xFF for unlocked device)
@@ -52,6 +53,7 @@ BSL_error_t bslGetID();
 BSL_error_t bslLoadPassword();
 BSL_error_t bslMassErase();
 BSL_error_t bslProgramData();
+BSL_error_t bslVerifyData();
 BSL_error_t bslStartApp();
 BSL_error_t bslGetResponse();
 void enterLightSleep();
@@ -274,7 +276,15 @@ bool performBSLProgramming() {
     return false;
   }
   
-  // Step 7: Start application
+  // Step 7: Verify programmed data
+  Serial.println("=== Starting Data Verification ===");
+  if (bslVerifyData() != eBSL_success) {
+    Serial.println("Data verification failed!");
+    return false;
+  }
+  Serial.println("=== Data Verification Passed ===");
+  
+  // Step 8: Start application
   if (bslStartApp() != eBSL_success) {
     Serial.println("Failed to start application");
     return false;
@@ -438,6 +448,107 @@ BSL_error_t bslProgramData() {
   }
   
   file.close();
+  return eBSL_success;
+}
+
+BSL_error_t bslVerifyData() {
+  Serial.println("Starting data verification...");
+  
+  File file = SPIFFS.open(FIRMWARE_PATH, "r");
+  if (!file) {
+    Serial.println("Failed to open firmware file for verification");
+    return eBSL_unknownError;
+  }
+  
+  const int blockSize = 128; // BSL block size
+  uint8_t originalBuffer[blockSize];
+  uint8_t readbackBuffer[blockSize];
+  uint32_t address = 0x00000000; // Starting address
+  uint32_t totalBytes = file.size();
+  uint32_t bytesVerified = 0;
+  
+  Serial.print("Verifying ");
+  Serial.print(totalBytes);
+  Serial.println(" bytes");
+  
+  while (file.available()) {
+    int bytesRead = file.read(originalBuffer, blockSize);
+    
+    // Send read command to get back the programmed data
+    BSL_TX_buffer[0] = PACKET_HEADER;
+    BSL_TX_buffer[1] = 0x05; // Length LSB (address + length)
+    BSL_TX_buffer[2] = 0x00; // Length MSB
+    BSL_TX_buffer[3] = CMD_TX_DATA_BLOCK;
+    
+    // Address (4 bytes, little-endian)
+    BSL_TX_buffer[4] = address & 0xFF;
+    BSL_TX_buffer[5] = (address >> 8) & 0xFF;
+    BSL_TX_buffer[6] = (address >> 16) & 0xFF;
+    BSL_TX_buffer[7] = (address >> 24) & 0xFF;
+    
+    // Data length (2 bytes, little-endian)
+    BSL_TX_buffer[8] = bytesRead & 0xFF;
+    BSL_TX_buffer[9] = (bytesRead >> 8) & 0xFF;
+    
+    // Calculate CRC
+    uint32_t crc = crc32_iso(&BSL_TX_buffer[3], 7);
+    BSL_TX_buffer[10] = (crc >> 0) & 0xFF;
+    BSL_TX_buffer[11] = (crc >> 8) & 0xFF;
+    BSL_TX_buffer[12] = (crc >> 16) & 0xFF;
+    BSL_TX_buffer[13] = (crc >> 24) & 0xFF;
+    
+    // Send read command
+    Serial2.write(BSL_TX_buffer, 14);
+    
+    // Wait for response and read back data
+    delay(100);
+    int responseBytes = 0;
+    while (Serial2.available() && responseBytes < (bytesRead + 8)) { // +8 for header and CRC
+      BSL_RX_buffer[responseBytes] = Serial2.read();
+      responseBytes++;
+    }
+    
+    if (responseBytes < (bytesRead + 8)) {
+      Serial.println("Insufficient readback data received");
+      file.close();
+      return eBSL_unknownError;
+    }
+    
+    // Extract readback data (skip header and CRC)
+    memcpy(readbackBuffer, &BSL_RX_buffer[4], bytesRead);
+    
+    // Compare original vs readback
+    bool blockMatch = true;
+    for (int i = 0; i < bytesRead; i++) {
+      if (originalBuffer[i] != readbackBuffer[i]) {
+        Serial.print("Mismatch at address 0x");
+        Serial.print(address + i, HEX);
+        Serial.print(": Original=0x");
+        Serial.print(originalBuffer[i], HEX);
+        Serial.print(" Readback=0x");
+        Serial.println(readbackBuffer[i], HEX);
+        blockMatch = false;
+        break;
+      }
+    }
+    
+    if (!blockMatch) {
+      Serial.println("Data verification failed - block mismatch");
+      file.close();
+      return eBSL_unknownError;
+    }
+    
+    address += bytesRead;
+    bytesVerified += bytesRead;
+    Serial.print("Verified ");
+    Serial.print(bytesVerified);
+    Serial.print("/");
+    Serial.print(totalBytes);
+    Serial.println(" bytes");
+  }
+  
+  file.close();
+  Serial.println("Data verification completed successfully!");
   return eBSL_success;
 }
 
