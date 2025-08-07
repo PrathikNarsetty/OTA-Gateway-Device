@@ -21,6 +21,7 @@
 #define CMD_PROGRAMDATA (0x20)
 #define CMD_TX_DATA_BLOCK (0x06)  // Read back programmed data
 #define CMD_START_APP (0x40)
+#define CMD_CHANGE_BAUD_RATE (0x52)  // Change baud rate command
 
 // BSL Password (all 0xFF for unlocked device)
 const uint8_t BSL_PW_RESET[32] = {
@@ -51,6 +52,7 @@ void enterBSL();
 bool performBSLProgramming();
 BSL_error_t bslConnection();
 BSL_error_t bslGetID();
+BSL_error_t bslChangeBaudRate();
 BSL_error_t bslLoadPassword();
 BSL_error_t bslMassErase();
 BSL_error_t bslProgramData();
@@ -260,19 +262,25 @@ bool performBSLProgramming() {
     return false;
   }
   
-  // Step 4: Load password
+  // Step 4: Change baud rate for faster transfer
+  if (bslChangeBaudRate() != eBSL_success) {
+    Serial.println("Baud rate change failed, continuing at 9600 baud");
+    // Continue anyway - some devices might not support baud rate change
+  }
+  
+  // Step 5: Load password
   if (bslLoadPassword() != eBSL_success) {
     Serial.println("Failed to load password");
     return false;
   }
   
-  // Step 5: Mass erase
+  // Step 6: Mass erase
   if (bslMassErase() != eBSL_success) {
     Serial.println("Mass erase failed");
     return false;
   }
   
-  // Step 6: Program firmware from SPIFFS
+  // Step 7: Program firmware from SPIFFS
   BSL_error_t programResult = bslProgramData();
   if (programResult != eBSL_success) {
     if (programResult == eBSL_criticalFailure) {
@@ -298,7 +306,7 @@ bool performBSLProgramming() {
   }
   Serial.println("=== Data Verification Passed ===");
   
-  // Step 8: Start application
+  // Step 9: Start application
   if (bslStartApp() != eBSL_success) {
     Serial.println("Failed to start application");
     return false;
@@ -356,6 +364,48 @@ BSL_error_t bslGetID() {
   Serial.println(" bytes");
   
   return eBSL_success;
+}
+
+BSL_error_t bslChangeBaudRate() {
+  Serial.println("Changing baud rate to 115200 for faster data transfer...");
+  
+  BSL_TX_buffer[0] = PACKET_HEADER;
+  BSL_TX_buffer[1] = 0x01; // Length LSB
+  BSL_TX_buffer[2] = 0x00; // Length MSB
+  BSL_TX_buffer[3] = CMD_CHANGE_BAUD_RATE;
+  
+  // Baud rate value (115200 = 0x0001C200)
+  BSL_TX_buffer[4] = 0x00; // LSB
+  BSL_TX_buffer[5] = 0xC2; // 
+  BSL_TX_buffer[6] = 0x01; // 
+  BSL_TX_buffer[7] = 0x00; // MSB
+  
+  uint32_t crc = crc32_iso(&BSL_TX_buffer[3], 5);
+  BSL_TX_buffer[8] = (crc >> 0) & 0xFF;
+  BSL_TX_buffer[9] = (crc >> 8) & 0xFF;
+  BSL_TX_buffer[10] = (crc >> 16) & 0xFF;
+  BSL_TX_buffer[11] = (crc >> 24) & 0xFF;
+  
+  Serial2.write(BSL_TX_buffer, 12);
+  
+  // Wait for response
+  BSL_error_t response = bslGetResponse();
+  
+  if (response == eBSL_success) {
+    Serial.println("Baud rate change successful, switching UART to 115200...");
+    
+    // Change ESP32 UART baud rate
+    Serial2.end();
+    delay(100);
+    Serial2.begin(115200, SERIAL_8N1, D0, D1);
+    delay(100);
+    
+    Serial.println("UART switched to 115200 baud");
+  } else {
+    Serial.println("Baud rate change failed, continuing at 9600 baud");
+  }
+  
+  return response;
 }
 
 BSL_error_t bslLoadPassword() {
